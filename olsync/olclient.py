@@ -88,8 +88,25 @@ class OverleafClient(object):
         Returns: List of project objects
         """
         projects_page = reqs.get(PROJECT_URL, cookies=self._cookie)
-        json_content = json.loads(
-            BeautifulSoup(projects_page.content, 'html.parser').find('meta', {'name': 'ol-projects'}).get('content'))
+        
+        if not projects_page.ok:
+            raise Exception(f"Failed to fetch projects: HTTP {projects_page.status_code}")
+    
+        soup = BeautifulSoup(projects_page.content, 'html.parser')
+    
+        # Try to find projects data in the prefetched projects meta tag (new Overleaf structure)
+        projects_meta = soup.find('meta', {'name': 'ol-prefetchedProjectsBlob'})
+        if projects_meta:
+            data = json.loads(projects_meta.get('content'))
+            if 'projects' in data:
+                return list(OverleafClient.filter_projects(data['projects']))
+            
+            # Fallback to old method
+            projects_meta = soup.find('meta', {'name': 'ol-projects'})
+        if not projects_meta:
+            raise Exception("Unable to find projects data - your session may have expired. Please try logging in again.")
+        
+        json_content = json.loads(projects_meta.get('content'))
         return list(OverleafClient.filter_projects(json_content))
 
     def get_project(self, project_name):
