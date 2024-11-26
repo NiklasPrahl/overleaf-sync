@@ -77,9 +77,17 @@ class OverleafClient(object):
 
             # CSRF changes after making the login request, new CSRF token will be on the projects page
             projects_page = reqs.get(PROJECT_URL, cookies=self._cookie)
-            self._csrf = BeautifulSoup(projects_page.content, 'html.parser').find('meta', {'name': 'ol-csrfToken'}) \
-                .get('content')
-
+            soup = BeautifulSoup(projects_page.content, 'html.parser')
+            
+            # Try new Overleaf structure first
+            csrf_meta = soup.find('meta', {'name': 'ol-csrfToken'})
+            if not csrf_meta:
+                # Fallback to old method
+                csrf_meta = soup.find('input', {'name': '_csrf'})
+            if not csrf_meta:
+                raise Exception("Unable to find CSRF token - login may have failed")
+            
+            self._csrf = csrf_meta.get('content') or csrf_meta.get('value')
             return {"cookie": self._cookie, "csrf": self._csrf}
 
     def all_projects(self):
@@ -115,10 +123,22 @@ class OverleafClient(object):
         Params: project_name, the name of the project
         Returns: project object
         """
-
         projects_page = reqs.get(PROJECT_URL, cookies=self._cookie)
-        json_content = json.loads(
-            BeautifulSoup(projects_page.content, 'html.parser').find('meta', {'name': 'ol-projects'}).get('content'))
+        soup = BeautifulSoup(projects_page.content, 'html.parser')
+        
+        # Try new Overleaf structure first
+        projects_meta = soup.find('meta', {'name': 'ol-prefetchedProjectsBlob'})
+        if projects_meta:
+            data = json.loads(projects_meta.get('content'))
+            if 'projects' in data:
+                return next(OverleafClient.filter_projects(data['projects'], {"name": project_name}), None)
+            
+            # Fallback to old method
+            projects_meta = soup.find('meta', {'name': 'ol-projects'})
+        if not projects_meta:
+            raise Exception("Unable to find projects data - your session may have expired. Please try logging in again.")
+        
+        json_content = json.loads(projects_meta.get('content'))
         return next(OverleafClient.filter_projects(json_content, {"name": project_name}), None)
 
     def download_project(self, project_id):
@@ -170,41 +190,61 @@ class OverleafClient(object):
 
         Returns: project details
         """
-        project_infos = None
-
-        # Callback function for the joinProject emitter
-        def set_project_infos(a, project_infos_dict, c, d):
-            # Set project_infos variable in outer scope
-            nonlocal project_infos
-            project_infos = project_infos_dict
-
-        # Convert cookie from CookieJar to string
-        cookie = "GCLB={}; overleaf_session2={}" \
-            .format(
-            self._cookie["GCLB"],
-            self._cookie["overleaf_session2"]
-        )
-
-        # Connect to Overleaf Socket.IO, send a time parameter and the cookies
-        socket_io = SocketIO(
-            BASE_URL,
-            params={'t': int(time.time())},
-            headers={'Cookie': cookie}
-        )
-
-        # Wait until we connect to the socket
-        socket_io.on('connect', lambda: None)
-        socket_io.wait_for_callbacks()
-
-        # Send the joinProject event and receive the project infos
-        socket_io.emit('joinProject', {'project_id': project_id}, set_project_infos)
-        socket_io.wait_for_callbacks()
-
-        # Disconnect from the socket if still connected
-        if socket_io.connected:
-            socket_io.disconnect()
-
-        return project_infos
+        headers = {
+            "X-Csrf-Token": self._csrf
+        }
+        
+        r = reqs.get(f"{PROJECT_URL}/{project_id}", cookies=self._cookie, headers=headers)
+        
+        if not r.ok:
+            raise Exception(f"Failed to fetch project: HTTP {r.status_code}")
+        
+        soup = BeautifulSoup(r.content, 'html.parser')
+        
+        # Try to get project data from ExposedSettings
+        settings_meta = soup.find('meta', {'name': 'ol-ExposedSettings'})
+        if settings_meta:
+            try:
+                data = json.loads(settings_meta.get('content'))
+                if 'project' in data:
+                    return data['project']
+                print(f"ol-ExposedSettings found but no project key. Keys: {list(data.keys())}")
+            except json.JSONDecodeError as e:
+                print(f"Failed to parse ol-ExposedSettings: {e}")
+        
+        # Try other meta tags if needed
+        for meta_name in ['ol-data', 'ol-project']:
+            project_meta = soup.find('meta', {'name': meta_name})
+            if project_meta:
+                try:
+                    data = json.loads(project_meta.get('content'))
+                    if meta_name == 'ol-data' and 'project' in data:
+                        return data['project']
+                    elif meta_name == 'ol-project':
+                        return data
+                except json.JSONDecodeError as e:
+                    print(f"Failed to parse {meta_name}: {e}")
+        
+        # If we get here, let's try to construct project info from individual meta tags
+        project_id_meta = soup.find('meta', {'name': 'ol-project_id'})
+        project_name_meta = soup.find('meta', {'name': 'ol-projectName'})
+        
+        if project_id_meta and project_name_meta:
+            try:
+                return {
+                    "_id": project_id_meta.get('content'),
+                    "name": project_name_meta.get('content')
+                }
+            except Exception as e:
+                print(f"Failed to construct project info from meta tags: {e}")
+        
+        # Debug output
+        all_meta = soup.find_all('meta')
+        meta_names = [meta.get('name') for meta in all_meta if meta.get('name')]
+        print(f"Found meta tags: {meta_names}")
+        print(f"Response content preview: {str(r.content)[:200]}...")
+        
+        raise Exception("Unable to find project data - your session may have expired. Please try logging in again.")
 
     def upload_file(self, project_id, project_infos, file_name, file_size, file):
         """
