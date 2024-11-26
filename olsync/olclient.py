@@ -258,14 +258,27 @@ class OverleafClient(object):
 
         Returns: True on success, False on fail
         """
-
-        # Set the folder_id to the id of the root folder
-        folder_id = project_infos['rootFolder'][0]['_id']
+        # First get the root folder ID via API if not in project_infos
+        if 'rootFolder' not in project_infos:
+            # Use project_id as root folder id - this is often the case in Overleaf
+            folder_id = project_id
+            folder_data = {"_id": folder_id, "folders": []}
+            
+            print(f"Using project ID as root folder ID: {folder_id}")
+        else:
+            # Use existing structure if available
+            folder_id = project_infos['rootFolder'][0]['_id']
+            folder_data = project_infos['rootFolder'][0]
 
         # The file name contains path separators, check folders
         if PATH_SEP in file_name:
             local_folders = file_name.split(PATH_SEP)[:-1]  # Remove last item since this is the file name
-            current_overleaf_folder = project_infos['rootFolder'][0]['folders']  # Set the current remote folder
+            
+            # Get current folder structure if needed
+            if 'rootFolder' not in project_infos:
+                current_overleaf_folder = folder_data.get('folders', [])
+            else:
+                current_overleaf_folder = project_infos['rootFolder'][0]['folders']
 
             for local_folder in local_folders:
                 exists_on_remote = False
@@ -279,9 +292,13 @@ class OverleafClient(object):
                 # Create the folder if it doesn't exist
                 if not exists_on_remote:
                     new_folder = self.create_folder(project_id, folder_id, local_folder)
-                    current_overleaf_folder.append(new_folder)
-                    folder_id = new_folder['_id']
-                    current_overleaf_folder = new_folder['folders']
+                    if new_folder:  # Check if folder creation was successful
+                        current_overleaf_folder.append(new_folder)
+                        folder_id = new_folder['_id']
+                        current_overleaf_folder = new_folder['folders']
+                    else:
+                        raise Exception(f"Failed to create folder: {local_folder}")
+
         params = {
             "folder_id": folder_id,
             "_csrf": self._csrf,
@@ -296,7 +313,18 @@ class OverleafClient(object):
         # Upload the file to the predefined folder
         r = reqs.post(UPLOAD_URL.format(project_id), cookies=self._cookie, params=params, files=files)
 
-        return r.status_code == str(200) and json.loads(r.content)["success"]
+        if not r.ok:
+            print(f"Upload failed with status {r.status_code}")
+            print(f"Response content: {r.content[:200]}...")
+            return False
+
+        try:
+            response_data = r.json()
+            return response_data.get("success", False)
+        except json.JSONDecodeError as e:
+            print(f"Failed to parse response: {str(e)}")
+            print(f"Response content: {r.content[:200]}...")
+            return False
 
     def delete_file(self, project_id, project_infos, file_name):
         """
